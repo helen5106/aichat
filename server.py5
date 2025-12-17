@@ -1,0 +1,720 @@
+import asyncio
+import json
+import re
+import uuid
+from typing import Dict, Any, List, Optional
+
+import httpx
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from utils.tools import (
+    detect_intent_and_quote_params,
+    format_quote_for_user,
+    send_lead_to_wpforms,
+    extract_prices_for_qty,
+    format_batch_quote_for_user,
+    get_calc_fn_by_product,
+)
+
+import os
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ------------------ 安全输入校验 ------------------
+
+def validate_and_sanitize_input(question: str, instruction: str = "") -> tuple[str, str]:
+    if len(question) > 1000:
+        raise ValueError("Question must be 1000 characters or less")
+    if len(instruction) > 2000:
+        raise ValueError("Instruction must be 2000 characters or less")
+    if not question.strip():
+        raise ValueError("Question cannot be empty")
+
+    dangerous_patterns = [
+        r"<script[^>]*>.*?</script>",
+        r"javascript:",
+        r"on\w+\s*=",
+        r"<iframe[^>]*>",
+        r"<object[^>]*>",
+        r"<embed[^>]*>",
+    ]
+    combined_text = f"{question} {instruction}".lower()
+    for pattern in dangerous_patterns:
+        if re.search(pattern, combined_text, re.IGNORECASE):
+            raise ValueError("Input contains potentially unsafe content")
+
+    question = question.replace("<", "&lt;").replace(">", "&gt;")
+    instruction = instruction.replace("<", "&lt;").replace(">", "&gt;")
+    return question.strip(), instruction.strip()
+
+
+# ------------------ AnythingLLM Client ------------------
+
+ANYTHINGLLM_BASE_URL = os.getenv("ANYTHINGLLM_BASE_URL", "http://127.0.0.1:3001/api/").rstrip("/")
+ANYTHINGLLM_API_KEY = os.getenv("ANYTHINGLLM_API_KEY", "")
+ANYTHINGLLM_WORKSPACE = os.getenv("ANYTHINGLLM_WORKSPACE", "qinprintingcom")
+ANYTHINGLLM_MODE = os.getenv("ANYTHINGLLM_MODE", "query")  # 建议 query
+
+_anythingllm_client: Optional[httpx.AsyncClient] = None
+
+
+@app.on_event("startup")
+async def _startup():
+    global _anythingllm_client
+    _anythingllm_client = httpx.AsyncClient(timeout=60)
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _anythingllm_client
+    if _anythingllm_client:
+        await _anythingllm_client.aclose()
+        _anythingllm_client = None
+
+
+async def ask_anythingllm(message: str, session_id: str) -> Dict[str, Any]:
+    """
+    Call AnythingLLM workspace chat API.
+    Returns:
+      { ok: bool, text: str, sources: list, error: str|None }
+    """
+    if not ANYTHINGLLM_API_KEY:
+        return {"ok": False, "text": "", "sources": [], "error": "Missing ANYTHINGLLM_API_KEY"}
+
+    url = f"{ANYTHINGLLM_BASE_URL}/v1/workspace/{ANYTHINGLLM_WORKSPACE}/chat"
+    headers = {
+        "Authorization": f"Bearer {ANYTHINGLLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "message": message,
+        "mode": ANYTHINGLLM_MODE,
+        "sessionId": session_id,
+        "reset": False,
+    }
+
+    try:
+        client = _anythingllm_client or httpx.AsyncClient(timeout=60)
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            return {"ok": False, "text": "", "sources": [], "error": f"AnythingLLM HTTP {r.status_code}: {r.text}"}
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "text": "", "sources": [], "error": f"AnythingLLM request failed: {e}"}
+
+    if data.get("error"):
+        return {"ok": False, "text": "", "sources": [], "error": str(data.get("error"))}
+
+    return {
+        "ok": True,
+        "text": (data.get("textResponse") or "").strip(),
+        "sources": data.get("sources") or [],
+        "error": None,
+    }
+
+
+def strict_kb_answer(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize AnythingLLM response:
+    - If KB is down -> fixed message.
+    - If KB returns text -> always show it (even if sources == []).
+    - Only fallback to "not enough info" when BOTH text and sources are empty.
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {"answer": "Sorry, the knowledge base is temporarily unavailable.", "sources": []}
+
+    sources = result.get("sources") or []
+    text = (result.get("text") or "").strip()
+
+    # ✅ 最重要：只要有 text，就直接给用户（不要因为 sources 为空而抹掉回答）
+    if text:
+        return {"answer": text, "sources": sources}
+
+    # 走到这里说明 text 为空
+    if sources:
+        # 有来源但没文本：极少见，给个安全兜底
+        return {"answer": "I found related website content, but it’s incomplete.", "sources": sources}
+
+    # text 和 sources 都空 -> 才是真的“没找到”
+    return {
+        "answer": (
+            "I’m not sure based on the information I have here.\n"
+            "Please feel free to contact us at sales@qinprinting.com."
+        ),
+        "sources": [],
+    }
+
+# ------------------ Quote slot-filling ------------------
+
+def _init_quote_ctx() -> Dict[str, Any]:
+    return {
+        "active": False,
+        "product_type": None,   # "hardcover_book"
+        "quantity": None,
+        "width": None,
+        "height": None,
+        "size_unit": None,      # "inch" | "mm"
+        "page_count": None,
+    }
+
+def _resolve_product_type(pt: Optional[str]) -> str:
+    fns = get_calc_fn_by_product()
+    # 兜底：未知就当 hardcover（你之前的策略）
+    if pt in fns:
+        return pt
+    return "hardcover_book"
+
+async def run_calc_for_product(product_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    统一跑一次 calc（single-qty）。
+    """
+    fns = get_calc_fn_by_product()
+    pt = _resolve_product_type(product_type)
+    calc_fn = fns[pt]
+
+    try:
+        raw = await asyncio.to_thread(calc_fn, params)
+        return raw
+    except Exception as e:
+        return {"error": f"Quote API failed: {e}", "raw_type": "error"}
+
+async def run_batch_calc_for_product(
+    product_type: str,
+    base_params: Dict[str, Any],
+    quantities: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    统一跑 batch calc（multi-qty），输出结构与你现在 batch_results 一致。
+    """
+    fns = get_calc_fn_by_product()
+    pt = _resolve_product_type(product_type)
+    calc_fn = fns[pt]
+
+    out: List[Dict[str, Any]] = []
+    for qty in quantities[:5]:
+        params_i = dict(base_params)
+        params_i["quantity"] = int(qty)
+
+        try:
+            raw_i = await asyncio.to_thread(calc_fn, params_i)
+        except Exception as e:
+            raw_i = {"error": f"Quote API failed: {e}", "raw_type": "error"}
+
+        try:
+            price_info = extract_prices_for_qty(raw_i, qty=int(qty))
+        except Exception:
+            price_info = {"total": None, "unit": None}
+
+        out.append({"qty": int(qty), "raw": raw_i, "price_info": price_info})
+
+    return out
+
+def merge_quote_ctx(quote_ctx: Dict[str, Any], intent_res: Dict[str, Any]) -> Dict[str, Any]:
+    if (intent_res.get("intent") or "").lower() == "quote":
+        quote_ctx["active"] = True
+
+    pt = intent_res.get("product_type")
+    if pt and pt != "unknown":
+        quote_ctx["product_type"] = pt
+
+    for k in ["quantity", "width", "height", "size_unit", "page_count"]:
+        v = intent_res.get(k)
+        if v is not None:
+            quote_ctx[k] = v
+            
+    quote_ctx["need_shipping"] = bool(intent_res.get("need_shipping"))
+    for k in ("shipping_country","shipping_postcode","shipping_region","shipping_city"):
+        if intent_res.get(k):
+            quote_ctx[k] = intent_res.get(k)
+    
+    return quote_ctx
+
+
+def compute_missing_hardcover(qctx: Dict[str, Any]) -> List[str]:
+    missing = []
+    if not isinstance(qctx.get("quantity"), int) or qctx["quantity"] <= 0:
+        missing.append("quantity")
+    if qctx.get("size_unit") not in ("inch", "mm"):
+        missing.append("size_unit")
+    if qctx.get("width") is None:
+        missing.append("width")
+    if qctx.get("height") is None:
+        missing.append("height")
+    if not isinstance(qctx.get("page_count"), int) or qctx["page_count"] <= 0:
+        missing.append("page_count")
+    return missing
+
+
+def build_history_str(st: Dict[str, Any], limit_turns: int = 6) -> str:
+    hist = (st.get("conversation_history") or [])[-limit_turns:]
+    out = []
+    for t in hist:
+        u = (t.get("user") or "").strip()
+        b = (t.get("bot") or "").strip()
+        if u:
+            out.append(f"User: {u}")
+        if b:
+            out.append(f"Bot: {b}")
+    return "\n".join(out).strip()
+
+
+def looks_like_affirmation(text: str) -> bool:
+    t = (text or "").strip().lower()
+    # 不叫 is_yes，但本质是“短确认词” —— 只有在 pending_fields 存在时才触发
+    return t in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "correct", "right", "please do", "go ahead"}
+
+
+def should_force_quote(st: Dict[str, Any], intent_res: Dict[str, Any], user_text: str) -> bool:
+    """
+    不依赖单句判定：当已有报价上下文/待补字段时，
+    - 用户补参数（抽取到了字段） or
+    - 用户给了尺寸/页数模式 or
+    - 用户用短确认词（且我们正等它）
+    则强制走 quote。
+    """
+    qctx = st.get("quote_ctx") or {}
+    if not qctx.get("active"):
+        return False
+
+    pending = st.get("pending_fields") or []
+    if pending and looks_like_affirmation(user_text):
+        return True
+
+    for k in ["quantity", "width", "height", "size_unit", "page_count"]:
+        if intent_res.get(k) is not None:
+            return True
+
+    txt = (user_text or "").lower()
+    if re.search(r"\b\d+(\.\d+)?\s*[x×]\s*\d+(\.\d+)?\b", txt):
+        return True
+    if "page" in txt or "pages" in txt:
+        return True
+    if "inch" in txt or "mm" in txt:
+        return True
+    if re.search(r"\b\d+\s*(pcs|pc|copies|copy)\b", txt):
+        return True
+
+    # 如果我们刚刚在问缺哪些字段，也默认继续 quote（除非用户明显是新话题）
+    if pending:
+        # “新话题”很难完美判断，这里保守点：只要不太长的疑问句，就当补参数
+        if len(txt) <= 40:
+            return True
+
+    return False
+
+
+def local_info_fallback(question: str) -> Optional[str]:
+    q = (question or "").strip().lower()
+    if q in {"who are you", "what are you", "what can you do", "help"}:
+        return (
+            "I’m QinPrinting’s website assistant.\n"
+            "I can help you understand printing options (book types, materials, binding, finishes), "
+            "and I can also generate an instant estimate for hardcover books if you tell me quantity, size, and page count."
+        )
+    return None
+
+
+# ------------------ HTTP 页面路由 ------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def root(_: Request):
+    return HTMLResponse("<h1>QinPrinting Chatbot</h1>", status_code=200)
+
+
+@app.get("/chatbot/v1", response_class=HTMLResponse)
+async def chatbot_index(_: Request):
+    try:
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse("<h1>QinPrinting Chatbot</h1>", status_code=200)
+
+
+@app.get("/chatbot/v1/set", response_class=HTMLResponse)
+async def chatbot_page(_: Request):
+    with open("static/chatbot.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/chatbot/v1/embed/chatbot.js", response_class=HTMLResponse)
+async def chatbot_js(_: Request):
+    with open("static/chatbot.js", "r", encoding="utf-8") as f:
+        content = f.read()
+    return HTMLResponse(content=content, headers={"Content-Type": "application/javascript"})
+
+
+# ------------------ WebSocket 状态管理 ------------------
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[WebSocket, Dict[str, Any]] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[websocket] = {
+            "session_id": str(uuid.uuid4()),
+            "conversation_history": [],
+            "user_profile": {"name": "", "email": ""},
+            "lead_sent": False,
+
+            "quote_ctx": _init_quote_ctx(),
+            "pending_fields": [],
+
+            "lock": asyncio.Lock(),  # 同一连接串行，防连点并发导致状态错乱
+        }
+        print("Client connected")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.pop(websocket, None)
+        print("Client disconnected")
+
+    def state(self, websocket: WebSocket) -> Dict[str, Any]:
+        return self.active_connections.get(websocket, {})
+
+    def set_state(self, websocket: WebSocket, state: Dict[str, Any]):
+        self.active_connections[websocket] = state
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/api/ws/chat")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+
+            msg_type = message.get("type")
+            payload = message.get("payload", {}) or {}
+
+            user_name = (payload.get("user_name") or "").strip()
+            user_email = (payload.get("user_email") or "").strip()
+            current_url = (payload.get("current_url") or "").strip()
+
+            # question
+            try:
+                question = payload.get("question")
+                if not question:
+                    raise ValueError("Question is missing.")
+                question, _ = validate_and_sanitize_input(question)
+            except ValueError as e:
+                await websocket.send_text(json.dumps({"type": "error", "payload": str(e)}))
+                continue
+
+            st = manager.state(websocket)
+
+            # 连接级串行（防止同一个 websocket 并发处理多条消息）
+            async with st["lock"]:
+
+                # 更新 user_profile
+                if user_name:
+                    st["user_profile"]["name"] = user_name
+                if user_email:
+                    st["user_profile"]["email"] = user_email
+
+                # 首次/开始：发送 lead（不阻塞）
+                if (msg_type == "start" or not st.get("lead_sent")) and (st["user_profile"]["name"] or st["user_profile"]["email"]):
+                    async def _send_lead():
+                        try:
+                            await asyncio.to_thread(
+                                send_lead_to_wpforms,
+                                st["user_profile"]["name"],
+                                st["user_profile"]["email"],
+                                current_url,
+                            )
+                        except Exception as e:
+                            print("send_lead_to_wpforms failed:", e)
+
+                    asyncio.create_task(_send_lead())
+                    st["lead_sent"] = True
+
+                # UI：类似 Mixam 的进度提示
+                await websocket.send_text(json.dumps({"type": "progress", "payload": "Thinking..."}))
+
+                # 1) 意图识别（带历史）
+                try:
+                    history_str = build_history_str(st, limit_turns=6)
+                    intent_res = await asyncio.to_thread(
+                        detect_intent_and_quote_params,
+                        question,
+                        history_str,
+                        st.get("quote_ctx") or _init_quote_ctx(),
+                    )
+
+                    # 先合并槽位
+                    st["quote_ctx"] = merge_quote_ctx(st.get("quote_ctx") or _init_quote_ctx(), intent_res)
+
+                    # 先取模型判断
+                    intent_final = (intent_res.get("intent") or "").lower()
+
+                    # 如果已有报价上下文/pending_fields，并且看起来在补参数 → 强制 quote
+                    #if intent_final != "quote" and should_force_quote(st, intent_res, question):
+                    #    intent_final = "quote"
+
+                    await websocket.send_text(json.dumps({
+                        "type": "progress",
+                        "payload": (
+                            f"Intent={intent_final} "
+                            f"product_type={intent_res.get('product_type')} "
+                            f"extracted={{"
+                            f"'quantity':{intent_res.get('quantity')},"
+                            f"'width':{intent_res.get('width')},"
+                            f"'height':{intent_res.get('height')},"
+                            f"'size_unit':{intent_res.get('size_unit')},"
+                            f"'page_count':{intent_res.get('page_count')}"
+                            f"}}"
+                        )
+                    }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({"type": "error", "payload": f"Intent detection failed: {e}"}))
+                    continue
+
+                # 2) quote 分支（默认 hardcover）
+                if intent_final == "quote":
+                    qctx = st.get("quote_ctx") or _init_quote_ctx()
+
+                    qctx["need_shipping"] = bool(intent_res.get("need_shipping"))
+                    for k in ("shipping_country","shipping_postcode","shipping_region","shipping_city"):
+                        if intent_res.get(k):
+                            qctx[k] = intent_res.get(k)
+                    st["quote_ctx"] = qctx
+
+                    # ✅ 你要求：找不到对应报价工具，就默认 hardcover
+                    if qctx.get("product_type") not in ("hardcover_book",):
+                        qctx["product_type"] = "hardcover_book"
+                        qctx["active"] = True
+                        st["quote_ctx"] = qctx
+
+                    # ---- multi-quantity handling (e.g., 50 / 100 / 200) ----
+                    quantities = intent_res.get("quantities") or []
+                    
+                    # 如果用户明确给了多档数量：直接批量算价，不要卡在 quantity missing
+                    if quantities:
+                        await websocket.send_text(json.dumps({"type": "progress", "payload": "Preparing multi-quantity quotes..."}))
+                    
+                        base_params = {
+                            "width": qctx.get("width"),
+                            "height": qctx.get("height"),
+                            "size_unit": qctx.get("size_unit"),
+                            "page_count": qctx.get("page_count"),
+                            # 可选：把用户原话带进去，便于后续做 lamination/finish 关键词识别
+                            "user_text": question,
+                        }
+                    
+                        # 仍然要确保尺寸/单位/页数齐全
+                        missing_base = [k for k in ["width", "height", "size_unit", "page_count"] if not base_params.get(k)]
+                        if missing_base:
+                            await websocket.send_text(json.dumps({
+                                "type": "final_answer",
+                                "payload": (
+                                    "To generate instant quotes for multi-quantity copies, I still need:\n"
+                                    f"- {', '.join(missing_base)}\n\n"
+                                    "Example: “6 x 9 inch, 112 pages”."
+                                ),
+                            }))
+                            manager.set_state(websocket, st)
+                            continue
+                    
+                        # 多数量计算
+                        pt = _resolve_product_type(qctx.get("product_type") or intent_res.get("product_type"))
+                        batch_results = await run_batch_calc_for_product(pt, base_params, quantities)
+
+                        try:
+                            final_text = await asyncio.to_thread(format_batch_quote_for_user, question, base_params, batch_results, raw_i)
+                        except Exception:
+                            final_text = f"Here is the raw quote result:\n{json.dumps(quote_raw, ensure_ascii=False)}"
+
+                        #--shipping cost--    
+                        need_ship = bool(intent_res.get("need_shipping") or qctx.get("need_shipping"))
+                        miss_ship = intent_res.get("missing_shipping_fields") or []
+                        
+                        if need_ship:
+                            ship_country = qctx.get("shipping_country")
+                            ship_postcode = qctx.get("shipping_postcode")
+                            ship_region = qctx.get("shipping_region")
+                            ship_city = qctx.get("shipping_city")
+                        
+                            if miss_ship:
+                                final_text += (
+                                    "\n\n---\n"
+                                    "If you'd like a shipping estimate, please share your destination **country** and **ZIP/postcode**. "
+                                )
+                            else:
+                                # 信息齐全：提交 shipping lead（不阻塞）
+                                async def _send_shipping_lead():
+                                    try:
+                                        extra = {
+                                            "need_shipping": True,
+                                            "shipping_country": ship_country,
+                                            "shipping_postcode": ship_postcode,
+                                            "shipping_region": ship_region,
+                                            "shipping_city": ship_city,
+                                            "note": "User requested shipping quote (chatbot).",
+                                        }
+                                        await asyncio.to_thread(
+                                            send_lead_to_wpforms,
+                                            st["user_profile"]["name"],
+                                            st["user_profile"]["email"],
+                                            current_url,
+                                            extra,
+                                        )
+                                    except Exception as e:
+                                        print("send shipping lead failed:", e)
+                        
+                                asyncio.create_task(_send_shipping_lead())
+                        
+                                final_text += (
+                                    "\n\n---\n"
+                                    f"Shipping request noted: **{ship_country} {ship_postcode}**. "
+                                    "At the moment I can’t calculate live shipping inside this chat, but once you provide those details, "
+                                    "I’ll forward your shipping request to our sales team for a precise quote."
+                                    "I’ve forwarded this to our sales team to calculate the most accurate shipping options (air/sea, and to-door if needed)."
+                                )
+    
+
+                        await websocket.send_text(json.dumps({
+                            "type": "final_answer",
+                            "payload": final_text,
+                            "raw_quote": {"raw_type": "batch", "data": batch_results},
+                        }))
+                    
+                        st["conversation_history"].append({"user": question, "bot": final_text})
+                        manager.set_state(websocket, st)
+                        continue
+
+                    missing = compute_missing_hardcover(qctx)
+                    st["pending_fields"] = missing
+
+                    if missing:
+                        # 给两条 progress
+                        await websocket.send_text(json.dumps({"type": "progress", "payload": "Configuring the quote..."}))
+
+                        await websocket.send_text(json.dumps({
+                            "type": "final_answer",
+                            "payload": (
+                                "To generate an instant hardcover book quote, I still need:\n"
+                                f"- {', '.join(missing)}\n\n"
+                                "Example: “100 copies, 8.5 x 11 inch, 64 pages”."
+                            ),
+                        }))
+
+                        # 不把这条当作 bot 历史（可选）；你想保留也行
+                        manager.set_state(websocket, st)
+                        continue
+
+                    # 组装给 calc API 的 params
+                    params = {
+                        "quantity": qctx["quantity"],
+                        "width": qctx["width"],
+                        "height": qctx["height"],
+                        "size_unit": qctx["size_unit"],
+                        "page_count": qctx["page_count"],
+                        "user_text": question,
+                    }
+
+                    await websocket.send_text(json.dumps({"type": "progress", "payload": "Preparing your quote..."}))
+                    try:
+                        pt = _resolve_product_type(qctx.get("product_type") or intent_res.get("product_type"))
+                        quote_raw = await run_calc_for_product(pt, params)
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({"type": "error", "payload": f"Quote API failed: {e}"}))
+                        manager.set_state(websocket, st)
+                        continue
+
+                    try:
+                        final_text = await asyncio.to_thread(format_quote_for_user, question, params, quote_raw)
+                    except Exception:
+                        final_text = f"Here is the raw quote result:\n{json.dumps(quote_raw, ensure_ascii=False)}"
+                        
+                    #--shipping cost--    
+                    need_ship = bool(intent_res.get("need_shipping") or qctx.get("need_shipping"))
+                    miss_ship = intent_res.get("missing_shipping_fields") or []
+                    
+                    if need_ship:
+                        ship_country = qctx.get("shipping_country")
+                        ship_postcode = qctx.get("shipping_postcode")
+                        ship_region = qctx.get("shipping_region")
+                        ship_city = qctx.get("shipping_city")
+                    
+                        if miss_ship:
+                            final_text += (
+                                "\n\n---\n"
+                                "If you'd like a shipping estimate, please share your destination **country** and **ZIP/postcode**. "
+                            )
+                        else:
+                            # 信息齐全：提交 shipping lead（不阻塞）
+                            async def _send_shipping_lead():
+                                try:
+                                    extra = {
+                                        "need_shipping": True,
+                                        "shipping_country": ship_country,
+                                        "shipping_postcode": ship_postcode,
+                                        "shipping_region": ship_region,
+                                        "shipping_city": ship_city,
+                                        "note": "User requested shipping quote (chatbot).",
+                                    }
+                                    await asyncio.to_thread(
+                                        send_lead_to_wpforms,
+                                        st["user_profile"]["name"],
+                                        st["user_profile"]["email"],
+                                        current_url,
+                                        extra,
+                                    )
+                                except Exception as e:
+                                    print("send shipping lead failed:", e)
+                    
+                            asyncio.create_task(_send_shipping_lead())
+                    
+                            final_text += (
+                                "\n\n---\n"
+                                f"Shipping request noted: **{ship_country} {ship_postcode}**. "
+                                "At the moment I can’t calculate live shipping inside this chat, but once you provide those details, "
+                                "I’ll forward your shipping request to our sales team for a precise quote."
+                                "I’ve forwarded this to our sales team to calculate the most accurate shipping options (air/sea, and to-door if needed)."
+                            )
+
+                    await websocket.send_text(json.dumps({
+                        "type": "final_answer",
+                        "payload": final_text,
+                        "raw_quote": quote_raw,  # 调试用
+                    }))
+
+                    st["conversation_history"].append({"user": question, "bot": final_text})
+                    manager.set_state(websocket, st)
+                    continue
+
+                # 3) info 分支：先回答一些通用问题（不依赖 KB）
+                local = local_info_fallback(question)
+                if local:
+                    await websocket.send_text(json.dumps({"type": "final_answer", "payload": local, "sources": []}))
+                    st["conversation_history"].append({"user": question, "bot": local})
+                    manager.set_state(websocket, st)
+                    continue
+
+                # 4) info -> AnythingLLM
+                session_id = st.get("session_id") or "default"
+                kb_res = await ask_anythingllm(question, session_id=session_id)
+                final = strict_kb_answer(kb_res)
+
+                await websocket.send_text(json.dumps({
+                    "type": "final_answer",
+                    "payload": final["answer"],
+                    "sources": final.get("sources", []),
+                }))
+
+                st["conversation_history"].append({"user": question, "bot": final["answer"]})
+                manager.set_state(websocket, st)
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
